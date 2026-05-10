@@ -7,6 +7,7 @@ function App() {
   const [question, setQuestion] = useState('');
   const [chatHistory, setChatHistory] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
 
   // Update this URL after you deploy the backend to Render
   const API_BASE_URL = "https://notebooklm-rag-3pn3.onrender.com";
@@ -17,6 +18,7 @@ function App() {
     if (!file) return;
 
     setUploadStatus("Processing source...");
+    setIsUploading(true);
     const formData = new FormData();
     formData.append("file", file);
 
@@ -32,6 +34,8 @@ function App() {
       }
     } catch (error) {
       setUploadStatus("❌ Connection error");
+    } finally {
+      setIsUploading(false);
     }
   };
 
@@ -74,12 +78,15 @@ function App() {
               <input
                 type="file"
                 accept="application/pdf"
-                onChange={(e) => setFile(e.target.files[0])}
+                onChange={(e) => {
+                  setFile(e.target.files[0]);
+                  setUploadStatus('');
+                }}
               />
-              <span>+ Add source</span>
+              <span>{file ? file.name : "+ Add source"}</span>
             </label>
-            <button type="submit" className="action-pill" disabled={!file || isLoading}>
-              Process PDF
+            <button type="submit" className="action-pill" disabled={!file || isLoading || isUploading}>
+              {isUploading ? "Processing..." : "Process PDF"}
             </button>
           </form>
           {uploadStatus && <p className="status-indicator">{uploadStatus}</p>}
