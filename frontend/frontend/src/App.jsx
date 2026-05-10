@@ -9,7 +9,7 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
 
   // Update this URL after you deploy the backend to Render
-  const API_BASE_URL = "http://localhost:8000";
+  const API_BASE_URL = "https://notebooklm-rag-3pn3.onrender.com";
 
   // --- Handle Ingestion ---
   const handleFileUpload = async (e) => {
