@@ -19,7 +19,7 @@ const COLLECTION_NAME = "NotebookLM_Gemini_Docs";
 
 // Initialize Gemini Embeddings model
 const embeddings = new GoogleGenerativeAIEmbeddings({
-    model: "text-embedding-004", // Latest Gemini embedding model
+    model: "gemini-embedding-001", // Or "gemini-embedding-2"
     apiKey: process.env.GEMINI_API_KEY,
 });
 
