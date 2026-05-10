@@ -3,15 +3,10 @@ import express from "express";
 import multer from "multer";
 import cors from "cors";
 import fs from "fs";
-import { v4 as uuidv4 } from "uuid";
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import { QdrantClient } from "@qdrant/js-client-rest";
-
-// Fix for pdf-parse in ES Modules
-import { createRequire } from "module";
-const require = createRequire(import.meta.url);
-const pdf = require("pdf-parse");
-const pdfParse = typeof pdf === "function" ? pdf : pdf.default;
+import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
+import { GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { QdrantVectorStore } from "@langchain/qdrant";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 
 const app = express();
 app.use(cors());
@@ -19,108 +14,97 @@ app.use(express.json());
 
 const upload = multer({ dest: "uploads/" });
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const qdrant = new QdrantClient({
-  url: process.env.QDRANT_URL,
-  apiKey: process.env.QDRANT_API_KEY,
+// Use a new collection name since the embedding model size changed (Gemini uses 768)
+const COLLECTION_NAME = "NotebookLM_Gemini_Docs";
+
+// Initialize Gemini Embeddings model
+const embeddings = new GoogleGenerativeAIEmbeddings({
+    model: "text-embedding-004", // Latest Gemini embedding model
+    apiKey: process.env.GEMINI_API_KEY,
 });
 
-const COLLECTION_NAME = "NotebookLM_Docs";
-
-async function ensureCollectionExists() {
-  try {
-    const collections = await qdrant.getCollections();
-    const exists = collections.collections.some((c) => c.name === COLLECTION_NAME);
-    if (!exists) {
-      console.log(`Creating Qdrant collection: ${COLLECTION_NAME}`);
-      await qdrant.createCollection(COLLECTION_NAME, {
-        vectors: { size: 768, distance: "Cosine" }, 
-      });
-    }
-  } catch (err) {
-    console.error("Error checking/creating collection:", err);
-  }
-}
-
-function chunkText(text, chunkSize = 1000, overlap = 200) {
-  const chunks = [];
-  let index = 0;
-  while (index < text.length) {
-    chunks.push(text.slice(index, index + chunkSize));
-    index += chunkSize - overlap;
-  }
-  return chunks;
-}
+// Qdrant configuration
+const qdrantConfig = {
+    url: process.env.QDRANT_URL || "http://localhost:6333",
+    apiKey: process.env.QDRANT_API_KEY,
+    collectionName: COLLECTION_NAME
+};
 
 // 1. UPLOAD & INDEXING
 app.post("/upload", upload.single("file"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    try {
+        if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-    await ensureCollectionExists();
+        console.log(`Loading PDF from ${req.file.path}...`);
+        const loader = new PDFLoader(req.file.path);
+        const rawDocs = await loader.load();
 
-    const dataBuffer = fs.readFileSync(req.file.path);
-    const pdfData = await pdfParse(dataBuffer);
-    const rawText = pdfData.text;
+        // Implement chunking strategy explicitly using RecursiveCharacterTextSplitter
+        const textSplitter = new RecursiveCharacterTextSplitter({
+            chunkSize: 1000,
+            chunkOverlap: 200,
+        });
 
-    const chunks = chunkText(rawText);
-    console.log(`Processing ${chunks.length} chunks...`);
+        const docs = await textSplitter.splitDocuments(rawDocs);
+        console.log(`Processing ${docs.length} chunks...`);
 
-    const embeddingModel = genAI.getGenerativeModel({ model: "embedding-001" });
-    
-    const points = [];
-    for (const chunk of chunks) {
-      const result = await embeddingModel.embedContent(chunk);
-      points.push({
-        id: uuidv4(),
-        vector: result.embedding.values,
-        payload: { text: chunk },
-      });
+        // Index into Qdrant Vector Store
+        await QdrantVectorStore.fromDocuments(docs, embeddings, qdrantConfig);
+        
+        // Clean up the uploaded file
+        fs.unlinkSync(req.file.path);
+
+        console.log("Indexing Completed");
+        res.json({ message: "Document successfully ingested!" });
+    } catch (error) {
+        console.error("Upload Error:", error);
+        res.status(500).json({ error: "Failed to process document" });
     }
-
-    await qdrant.upsert(COLLECTION_NAME, { wait: true, points });
-    fs.unlinkSync(req.file.path);
-
-    res.json({ message: "Document successfully ingested!" });
-  } catch (error) {
-    console.error("Upload Error:", error);
-    res.status(500).json({ error: "Failed to process document" });
-  }
 });
 
 // 2. RETRIEVAL & GENERATION
 app.post("/ask", async (req, res) => {
-  try {
-    const { question } = req.body;
-    if (!question) return res.status(400).json({ error: "Question required" });
+    try {
+        const { question } = req.body;
+        if (!question) return res.status(400).json({ error: "Question required" });
 
-    const embeddingModel = genAI.getGenerativeModel({ model: "embedding-001" });
-    const queryEmbeddingResult = await embeddingModel.embedContent(question);
-    
-    const searchResults = await qdrant.search(COLLECTION_NAME, {
-      vector: queryEmbeddingResult.embedding.values,
-      limit: 4,
-    });
+        // Retrieve from Vector Store
+        const vectorStore = await QdrantVectorStore.fromExistingCollection(embeddings, qdrantConfig);
+        
+        const retriever = vectorStore.asRetriever({
+            k: 3
+        });
 
-    const contextText = searchResults.map((r) => r.payload.text).join("\n\n");
-    const llmModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-    
-    const prompt = `You are a highly accurate AI assistant.
-    Rule 1: Answer ONLY based on the provided Context.
-    Rule 2: If the answer is not in the Context, say: "I cannot answer this based on the provided document."
-    
-    Context:
-    ${contextText}
-    
-    User Question: ${question}`;
+        const searchedChunks = await retriever.invoke(question);
 
-    const result = await llmModel.generateContent(prompt);
-    res.json({ answer: result.response.text() });
-  } catch (error) {
-    console.error("Ask Error:", error);
-    res.status(500).json({ error: "Failed to generate answer" });
-  }
+        // Generation with Gemini
+        const llm = new ChatGoogleGenerativeAI({
+            model: "gemini-1.5-flash",
+            apiKey: process.env.GEMINI_API_KEY,
+        });
+
+        const system_prompt = `You are an AI Assistant who helps resolving the user query based on the avaliable context provided to you from PDF file with the content and page number.
+
+        Rule :
+        - Only answer based on the avaliable context from the file only.
+        - If the answer is not in the context, say: "I cannot answer this based on the provided document."
+
+        context : ${JSON.stringify(searchedChunks)}`;
+
+        const response = await llm.invoke([
+            ["system", system_prompt],
+            ["human", question]
+        ]);
+
+        const answer = response.content;
+        console.log("Generated Answer:", answer);
+        
+        res.json({ answer: answer });
+    } catch (error) {
+        console.error("Ask Error:", error);
+        res.status(500).json({ error: "Failed to generate answer" });
+    }
 });
 
 const PORT = process.env.PORT || 8000;
-app.listen(PORT, () => console.log(`🚀 Backend running on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Backend running on port ${PORT}`));
